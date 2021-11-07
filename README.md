@@ -40,13 +40,14 @@ The survey data and questions were taken from the publically available dataset c
 - **Q27:** *Taking quizzes and exams online from home was not comfortable and made me nervous.*
 
 ## **Below is the Virtual Reality Question key for the VR section of our simulated study:***
-- **VR_question_1:** *(Suad please put text here)*	
-- **VR_question_2:** *(Suad please put text here)*	
-- **VR_question_3:** *(Suad please put text here)*	
-- **VR_question_4:** *(Suad please put text here)*	
-- **VR_question_5:** *(Suad please put text here)*	
-- **VR_question_6:** *(Suad please put text here)*	
-- **VR_question_7:** *(Suad please put text here)*	
-- **VR_question_8:** *(Suad please put text here)*	
-- **VR_question_9:** *(Suad please put text here)*	
-- **VR_question_10:** *(Suad please put text here)*	
+*It is important to notice that the questions were registered with diffrent like using the keyword* **_Medication_** *or* **_Drugs_** 
+- **VR_question_1:** *Do you know when you were diagnosed with dementia?*	
+- **VR_question_2:** *Do you use a diary or “to-do list” to remember things?*	
+- **VR_question_3:** *What medications do you currently take for dementia?*	
+- **VR_question_4:** *What time do you take your dementia medication?*	
+- **VR_question_5:** *Do you take any herbal supplement?*	
+- **VR_question_6:** *Do you feel the medications are helping?*	
+- **VR_question_7:** *Overall, how is your memory?*	
+- **VR_question_8:** *Do you follow up with someone?*	
+- **VR_question_9:** *Do you have a stomach pain when taking your dementia medication?*	
+- **VR_question_10:** *How is your living situation?*	
