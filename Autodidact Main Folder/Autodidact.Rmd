@@ -1,0 +1,680 @@
+---
+title: "Autodidact"
+author: a PMCD data dashboard \vspace{2mm}
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    logo: images/autodidact_fav_icon_32.png
+    favicon: images/autodidact_fav_icon_32.png
+    theme: flatly
+runtime: shiny
+---
+
+```{r setup and data prep, include = FALSE}
+
+# Set seed for randomized processes ----
+
+set.seed(1337) # We are LEET hackers
+
+# Libraries----
+
+library(tidymodels)     # for building my models
+library(performanceEstimation) # for the smote fun
+library(shiny)          # for the shiny web app
+library(shinyWidgets)   # for custom shiny components
+
+library(VIM)            # for visualizing MICE plots
+library(mice)           # for missing val imputation
+
+library(gsheet)         # for accessing the data
+
+library(shinyjs)        # for javascript operations
+library(readr)          # for importing data
+library(vip)            # for variable importance plots
+library(viridis)        # for cool colors B^]
+library(janitor)        # for clean names and tabyl
+library(randomForest)   # for the random forest model
+library(pROC)           # for obtaining the ROC of my models
+library(ggplot2)        # for detailed plots ("grammar of graphics")
+library(GGally)         # an extension to ggplot, adds functionalities
+library(rsample)        # to split the data into training and testing
+library(DT)             # for data tables
+library(ranger)         # for the randomForest() functions
+library(rsconnect)      # to upload the shinyapp to shinyapp.io
+
+# Modeling objective: 1) Determine what factors contribute towards a student having different classes of GPA, 2) Determine if VR improves a student's GPA.
+
+# Import data----
+data_raw<-as.data.frame(gsheet2tbl("https://docs.google.com/spreadsheets/d/1MLyWsCkhvQ3O3HhQgV7S2oPmhXsEj8FQ-G5UgLJ5fy0/edit?usp=sharing"))
+
+data2_raw<-as.data.frame(gsheet2tbl("https://docs.google.com/spreadsheets/d/1GlHeenzRMQ_YZZb-gYr2fbBpXUWGy9tWCcZuRESah8Q/edit?usp=sharing"))
+
+## CLEANING DATA 1 ----
+# Manual colnames cleaning for the jordanian data----
+  survey_Qkey <- colnames(data_raw[,c(4:ncol(data_raw))]) # Get the question key for the Before / After survey questions
+  data_raw <- data_raw %>% select(-`Start time`, -`Completion time`)
+  
+  jordan_colnames <-
+    c(
+      "id",
+      "gender",
+      "level_year",
+      "age",
+      "gpa",
+      "Q1BC", # BC = Before Covid
+      "Q1AC", # AC = After Covid
+      "Q2BC",
+      "Q2AC",
+      "Q3BC",
+      "Q3AC",
+      "Q4BC",
+      "Q4AC",
+      "Q5BC",
+      "Q5AC",
+      "Q6BC",
+      "Q6AC",
+      "Q7BC", # BC = Before Covid
+      "Q7AC", # AC = After Covid
+      "Q15", # Questions no longer asking before / after covid
+      "Q16",
+      "Q17",
+      "Q18",
+      "Q19",
+      "Q20",
+      "Q21",
+      "Q22",
+      "Q23",
+      "Q24",
+      "Q25",
+      "Q26",
+      "Q27"
+    )
+  
+  data_work = data_raw
+  colnames(data_work) <- jordan_colnames
+
+# Fix the GPA scores within data_work----
+  
+  levels(as.factor(data_raw$`Your cumulative average (GPA)`))
+  data_work <- data_work %>% mutate(
+    over_90_gpa = ifelse(grepl("25.71428571", gpa, ), '90', NA),
+    range_80_89 = ifelse(grepl("80-89 / 3-3.49", gpa), '80', NA),
+    range_70_79 = ifelse(grepl("70-79 / 2.5-299", gpa), '70', NA),
+    range_60_69 = ifelse(grepl("60-69 / 2-2.49", gpa, ), '60', NA),
+    below_60 = ifelse(grepl("Below 60 / Below 2.0", gpa, ), '59', NA),
+    gpa_avg = coalesce(over_90_gpa, range_80_89, range_70_79, range_60_69, below_60)
+  ) %>% select(-over_90_gpa,
+               -range_80_89,
+               -range_70_79,
+               -range_60_69,
+               -below_60,
+               -gpa, #Drop GPA artifact, drop times related to start and finishing survey
+               ) %>% mutate(gpa_avg = as.factor(gpa_avg)) # Convert GPA to factor for classification
+  
+# Convert the survey data into likert scale, dichotomize gender, and itemize demographics----
+  recode_vec = c(
+    'Strongly Disagree' = 0,
+    'Disagree' = 1,
+    'Uncertain' = 2,
+    'Agree' = 3,
+    'Strongly Agree' = 4,
+    '3-6' = 1,
+    '6-9' = 2,
+    '9-12' = 3,
+    '+12' = 4,
+    '1-3' = 0,
+    'Male' = 0,
+    'Female' = 1,
+    'First/Freshman' = 1,
+    'Second/ Sophomore' = 2,
+    'Third/Junior' = 3,
+    'Fourth/Senior' = 4,
+    'Other' = 0,
+    'Mobile phone' = 1,
+    'Laptop' = 2,
+    'I pad/ Tablet' = 3,
+    'Personal Computer' = 4,
+    '18-24'=1,
+    '25-30'=2,
+    '30'=3
+  )
+
+myrecode <- function(x){
+  recode(x, !!!recode_vec)
+}
+
+# Select columns to mutate based on containing unrecoded versions 
+# of the answers
+data_work = data_work %>% 
+  mutate(across(where(~any(. %in% names(recode_vec))), myrecode))
+
+# Reorder the data so it's easier to interpret
+data_work <- data_work %>% relocate(gpa_avg, .after = id) %>% select(-id) #drop ID so we can SMOTE, rows are now student ID
+data_work <- data_work[!is.na(data_work$gpa_avg),]
+
+table(data_work$gpa_avg)
+
+## CLEANING DATA 2 ----
+# Manual colnames cleaning for the TestScore Student data----
+  test_Qkey <- colnames(data2_raw[,c(2:11)]) # Get the test score key for student data
+  testscore_colnames <-
+    c(
+      "id",
+      "VR_question_1",
+      "VR_question_2",
+      "VR_question_3",
+      "VR_question_4",
+      "VR_question_5",
+      "VR_question_6",
+      "VR_question_7",
+      "VR_question_8",
+      "VR_question_9",
+      "VR_question_10",
+      "VR_test_score",
+      "gpa"
+    )
+  
+  data2_work = data2_raw
+  colnames(data2_work) <- testscore_colnames
+
+# Fix the GPA scores within data2_work----
+  data2_work$gpa <- round(data2_work$gpa)
+  data2_work <- data2_work %>% mutate(
+    over_90_gpa = ifelse(gpa >= 90, '90', NA),
+    range_80_89 = ifelse(gpa >= 80 & gpa <= 89, '80', NA),
+    range_70_79 = ifelse(gpa >= 70 & gpa <= 79, '70', NA),
+    range_60_69 = ifelse(gpa >= 60 & gpa <= 69, '60', NA),
+    below_60 = ifelse(gpa <= 59, '59', NA),
+    gpa_avg = coalesce(over_90_gpa, range_80_89, range_70_79, range_60_69, below_60)
+  ) %>% select(-over_90_gpa,
+               -range_80_89,
+               -range_70_79,
+               -range_60_69,
+               -below_60,
+               -gpa, #Drop GPA artifact, drop times related to start and finishing survey
+               ) %>% mutate(gpa_avg = as.factor(gpa_avg)) # Convert GPA to factor for classification
+  data2_work <- data2_work %>% relocate(gpa_avg, .after = id) %>% select(-id, -VR_test_score) #drop ID so we can SMOTE, rows are now student ID
+  table(data2_work$gpa_avg)
+  
+  # Create an arbitrary class identifier for VR class use
+  # data_work$VR_Use <- as.factor(0)
+  # data2_work$VR_Use <- as.factor(1)
+  # data_work <- data_work %>% relocate(VR_Use, .after = gpa_avg)
+  # data2_work <- data2_work %>% relocate(VR_Use, .after = gpa_avg)
+  
+# COMBINE DATASETS----
+
+  combData <- plyr::rbind.fill(data_work, data2_work) # Coerces NA by filling the bottom rows
+  
+  # mice_plot <- aggr(combData, col=c('navyblue', 'yellow'), numbers=TRUE, sortVars=TRUE, labels=names(combData), cex.axis=0.7, gap=3, ylab=c("Missing data", "Pattern"))  
+  
+  combData_mice <- mice(combData, m = 1, maxit = 30, method = "pmm", seed = 1337)
+  combData <- complete(combData_mice, 1)
+
+# Use SMOTE to create more "balanced" classes
+  set.seed(1337)
+  combData_fin <- smote(gpa_avg ~ ., combData, perc.over = 60, perc.under=5)
+  combData_fin <- na.omit(combData_fin) # get rid of coerced NAs by SMOTE
+  combData_fin_gpa <- combData_fin$gpa_avg
+  # combData_fin_VR <- combData_fin$VR_Use
+  combData_fin <- round(combData_fin[2:ncol(combData_fin)])
+  combData_fin <- cbind(combData_fin_gpa, combData_fin)
+  names(combData_fin)[1] <- "gpa_avg"
+  # names(combData_fin)[2] <- "VR_Use"
+  table(combData_fin$gpa_avg)
+  
+  # Reorder the data by the new student ID column
+  combData_fin$index <- as.numeric(row.names(combData_fin))
+  combData_fin <- combData_fin[order(combData_fin$index), ]
+  combData_fin <- combData_fin %>% relocate(index, .before = gpa_avg)
+  colnames(combData_fin)[1] <- "Student.ID"  
+  
+  # Provide a list of question variables that can be tested in Panel 3
+  no_VR_vars<-colnames(data_work[6:ncol(data_work)])
+  # no_VR_vars <- no_VR_vars[c(5:31)] # Do not include demographics!
+  
+  VR_vars<- colnames(data2_work[,2:11])
+  VR_vars <- c(no_VR_vars, VR_vars)
+
+# Next steps: automatically add data from users who undergo our virtual reality test
+
+```
+
+
+Sidebar {.sidebar}
+===========================================================
+
+`r h3("Dashboard Options:")`
+`r h3("Select how you want to gauge your students' performance.")`
+`r h4("Determine how new technologies influence their performance.")`
+
+- - -
+
+```{r, shiny.inputs}
+
+grade_threshold <- as.numeric(c(60, 70, 80, 90, 100))
+
+outcomes_choices <- as.character(c(
+    "Exclude VR questions",
+    "Include VR questions"
+  ))
+
+class_levels <- as.character(c(
+    "All students",
+    "First Years Only",
+    "Second Years Only",
+    "Third Years Only",
+    "Fourth Years Only"
+  ))
+
+useShinyjs(rmd = TRUE)
+
+br()
+
+# br()
+# br()
+
+sliderInput(
+  inputId = "grade_threshold",
+  label   = h4("Select the minimum grade to pass:"),
+  min     = 60,
+  max     = 100,
+  value   = 80,
+  step    = 0.5,
+  ticks   = FALSE)
+
+radioButtons(
+  inputId = "outcomes_selection",
+      label = "See how VR influences GPA: ",
+  choices = outcomes_choices
+    )
+
+selectInput(
+  inputId = "class_selection",
+      label = "Select which class group do you want to analyze: ",
+  choices = class_levels
+    )
+
+selectInput(
+  inputId = "question_selection",
+      label = "See how your students answered per question: ",
+  choices = VR_vars
+    )
+
+br()
+hr()
+br()
+
+
+
+```
+
+```{r data.norm}
+
+# Define the user's input ----
+gradethresh_cat <- reactive({
+  as.numeric(input$grade_threshold)
+})
+
+outcomes_cat <- reactive({
+  as.character(input$outcomes_selection)
+})
+
+class_cat <- reactive({
+  as.character(input$class_selection)
+})
+
+question_cat <- reactive({
+  as.character(input$question_selection)
+})
+
+# Reduces the gpa_avg into a binary classifier based on user selection -----
+
+data_grade <- reactive({
+  if (gradethresh_cat() >= 60 & gradethresh_cat() <= 69) {
+    data_grade <-
+      combData_fin %>% mutate(gpa_avg = factor(ifelse(
+        gpa_avg == '60' |
+          gpa_avg == '70' | gpa_avg == '80' | gpa_avg == '90', 1,0)))
+  }
+  else if (gradethresh_cat() >= 70 & gradethresh_cat() <= 79) {
+    data_grade = combData_fin %>% mutate(gpa_avg = factor(ifelse(gpa_avg == '70' |
+                                                            gpa_avg == '80' | gpa_avg == '90', 1, 0)))
+  }
+  else if (gradethresh_cat() >= 80 & gradethresh_cat() <= 89) {
+    data_grade = combData_fin %>% mutate(gpa_avg = factor(ifelse(gpa_avg == '80' |
+                                                            gpa_avg == '90', 1, 0)))
+  }
+  else {
+      data_grade = combData_fin %>% mutate(gpa_avg = factor(ifelse(gpa_avg == '90', 1, 0)))
+    }
+})
+
+# Filters by student grade, or 'class', if selected -----
+
+data_class <- reactive({
+  if (class_cat() == "All students") {
+    data_class <- data_grade()
+  } else if (class_cat() == "First Years Only"){
+    data_class <- data_grade() %>% filter(level_year == 1)
+  } else if (class_cat() == "Second Years Only"){
+    data_class <- data_grade() %>% filter(level_year == 2)
+  } else if (class_cat() == "Third Years Only"){
+    data_class <- data_grade() %>% filter(level_year == 3)
+  } else {data_class <- data_grade() %>% filter(level_year == 4)}
+})
+
+# Subsets the data for a random forest where VR Use is kept as a classifier or not -----
+
+data_out <- reactive({
+  if (outcomes_cat() == "Exclude VR questions") {
+    data_out <-
+      data_class() %>% select(
+        -VR_question_1,
+        -VR_question_2,
+        -VR_question_3,
+        -VR_question_4,
+        -VR_question_5,
+        -VR_question_6,
+        -VR_question_7,
+        -VR_question_8,
+        -VR_question_9,
+        -VR_question_10
+      )
+  } else {data_out <-
+      data_class()}
+})
+
+# Split the data into training and testing ----
+# Drop student ID and student year as factors within the data model
+data_model <- reactive({data_out() %>% select(-Student.ID, -level_year)})
+
+# Create data splits
+set.seed(1337) #for reproducibility
+data_split = reactive({
+  data_model() %>%
+    rsample::initial_split(prop = 0.8)
+})
+
+# pull train set
+set.seed(1337) #for reproducibility
+data_train = reactive({
+training(data_split())
+})
+
+# pull test set
+set.seed(1337) #for reproducibility
+data_test = reactive({
+testing(data_split())
+})
+
+
+```
+
+```{r, data.recipe}
+
+# # Create the 's and Random Forest's recipe ----
+data_recipe <-
+  reactive({
+        set.seed(1337) #for reproducibility
+        data_recipe <- data_train() %>%
+          recipe(gpa_avg ~ .) %>%
+          step_corr(all_numeric()) %>%
+          prep()
+        data_recipe # Prints the recipe
+  })
+
+```
+
+```{r create.model}
+
+set.seed(1337) #for reproducibility
+rf_mod = reactive({
+  rand_forest(trees = 30, mode = "classification") %>% set_engine("ranger", importance = "impurity")
+})
+
+# rf_mod
+
+```
+
+```{r create.workflow}
+
+rf_workflow <- reactive({
+  workflow() %>% add_model(rf_mod()) %>%
+    add_recipe(data_recipe())
+})
+
+```
+
+```{r fit.training with RF}
+set.seed(1337) #for reproducibility
+rf_fit <- reactive({
+  rf_workflow() %>%
+    fit(data = data_train()) # This is where the formula breaks down
+})
+
+# Perform 10-fold Cross Validation ----
+
+K_fold_CV <- reactive({
+  kfolds<-rsample::vfold_cv(data_train, v = 10)
+})
+
+rf_validation <- reactive({
+  fit_resamples(rf_workflow(), K_fold_CV())
+})
+
+```
+
+
+```{r, roc.plot, eval = TRUE}
+rf_probs <- reactive({
+  rf_fit() %>%
+    predict(data_test(), type = "prob") %>%
+    bind_cols(data_test())
+})
+
+```
+
+Data Summary
+===========================================================
+
+## Column {data-width="500"}
+
+
+### Pass or Fail Count - Grade Point Average
+
+```{r}
+
+# Select only GPA from the final data_frame
+
+ONLY_gpa <- reactive({data_out() %>% select(gpa_avg)})
+
+gpa_avg_df <- reactive({
+ as.data.frame(as.matrix(table(ONLY_gpa())))})
+
+  gpa_avg_df2 <- reactive({
+    gpa_avg_df() %>% mutate(Index = rownames(gpa_avg_df()))
+  })
+
+# Create a blank theme for the pie chart
+  
+blank_theme <- theme_minimal()+
+  theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.border = element_blank(),
+  panel.grid=element_blank(),
+  axis.ticks = element_blank(),
+  plot.title=element_text(size=14, face="bold")
+  )
+
+output$gpa_plot <- renderPlot({
+  gpa_avg_df2() %>% ggplot(aes(x="", y=V1, fill=Index)) + geom_bar(width=1, stat = "identity", alpha = 0.5) + coord_polar("y", start = 0) + blank_theme + scale_fill_manual(labels = c("Fail", "Pass"), values = c("#FF3632", "#00ebc9")) + geom_text(aes(y = V1/2 + c(0, cumsum(V1)[-length(V1)]), 
+            label = V1), size=5)
+})
+
+plotOutput(outputId = "gpa_plot")
+
+```
+
+### Question Viewer
+
+```{r}
+
+data_class_gpa <- reactive({data_class() %>% select(gpa_avg)})
+
+data_class_q <- reactive({
+  data_class() %>% select(question_cat())
+})
+
+
+data_q_comb <- reactive({cbind(data_class_gpa(), data_class_q())})
+
+data_q_DT <- reactive({
+  as.data.frame(as.matrix(table(data_q_comb())))
+})
+
+output$question_plot <- renderPlot({
+  data_q_DT() %>% ggplot(aes(x = question_cat(),
+                             y = Freq,
+                             fill = gpa_avg)) + geom_bar(stat = "identity", position = "dodge") + labs(x = paste0("Breakdown of Fail or Pass for question ", question_cat()), y = "Number of Students")
+})
+
+plotOutput(outputId = "question_plot") # Please God work
+
+```
+
+Column {.tabset}
+-------------------------------------
+
+### Factors influencing GPA
+
+```{r, vip.plot.rf}
+
+output$vip_plot_rf <- renderPlot({
+  rf_last_fit() %>%
+    pluck(".workflow", 1) %>%
+    pull_workflow_fit() %>%
+    vip(num_features = 20,
+        aesthetics = list(fill = "purple4")) + theme_light()
+})
+
+plotOutput(outputId = "vip_plot_rf")
+
+```
+
+### Individual Student Viewer
+
+```{r}
+combData_fin %>% mutate(Student.ID = paste0("Student_", Student.ID)) %>%
+  slice() %>%
+  datatable(options = list(searching = TRUE,
+                           pageLength = 25),
+            style = "bootstrap")
+
+```
+
+Stats for Nerds
+===========================================================
+
+## Column {data-width="1000"}
+
+```{r, plot roc.plot, eval = TRUE}
+
+# renderPrint(rf_probs())
+
+output$rf_roc_plot <- renderPlot({
+    rf_probs() %>%
+      roc_curve(gpa_avg, .pred_1) %>% autoplot()
+})
+
+ plotOutput(outputId = "rf_roc_plot")
+
+ ### CV Plot(s): Random Forest
+
+
+```
+
+```{r, k.fold.val and conf.mat.rf}
+
+# Perform 10-fold Cross Validation ----
+
+K_fold_CV <-reactive({rsample::vfold_cv(data_train(), v = 10)})
+
+rf_last_fit <- reactive({last_fit(rf_workflow(), data_split())})
+
+# Confusion matrix ----
+
+conf_mat_rf <- reactive({
+  rf_last_fit() %>%
+    collect_predictions() %>%
+    conf_mat(truth = "gpa_avg", estimate = .pred_class)
+})
+
+```
+
+```{r, conf.mat.rf.plot}
+
+output$conf_mat_rf_plot <- renderPlot({
+  conf_mat_rf() %>% autoplot("heatmap") + scale_fill_distiller(palette = "GnBu") + theme(
+    axis.text = element_text(colour = "black", size = rel(1.1)),
+    title = element_text(colour = "black", size = rel(1.1))
+  )
+})
+
+plotOutput(outputId = "conf_mat_rf_plot")
+
+```
+
+## Column {data-width="1000"}
+
+### Data Splitting
+
+**Total Observations:**  
+`r reactive({dim(data_out())[1]})`
+
+**Training Set:**  
+`r reactive({dim(data_train())[1]})`
+
+**Testing Set:**  
+`r reactive({dim(data_test())[1]})`
+
+### How it works: Data Recipie and Workflow
+
+```{r}
+renderPrint(data_recipe())
+
+renderPrint(rf_workflow())
+```
+
+### Prediction Metrics
+
+```{r, rf.pred.metrics}
+
+output$metrics_rf <- renderTable({
+  conf_mat_rf() %>%
+    summary() %>%
+    select(-.estimator)
+})
+
+tableOutput(outputId = "metrics_rf")
+
+```
+
+### 10-Fold Cross Validation Metrics
+
+```{r rf.CV.pred.met}
+
+rf_validation <-
+  reactive({
+    fit_resamples(rf_workflow(), K_fold_CV())
+  })
+
+output$CV_metrics <- renderTable({
+  rf_validation() %>% collect_metrics() %>% select(".metric", "mean", "std_err")
+})
+
+tableOutput(outputId = "CV_metrics")
+
+```
